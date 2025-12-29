@@ -856,11 +856,9 @@ class BananaMorphologyTab(QWidget):
         control_layout.addStretch()
         main_layout.addWidget(control_widget)
 
-        # WebView
         self.webview = QWebEngineView()
         main_layout.addWidget(self.webview, stretch=1)
 
-        # WebChannel
         self.channel = QWebChannel()
         self.camera_handler = CameraHandler()
         self.camera_handler.set_callback(self._update_saved_camera)
@@ -876,9 +874,23 @@ class BananaMorphologyTab(QWidget):
         self.import_params("inner", auto=True, filename="Li_vs_Wf_Fit_Parameters.xlsx")
         self.import_params("circumference", auto=True, filename="Lc_vs_Wf_Fit_Parameters.xlsx")
 
+    def radius_profile(self, t, R_p, R_max, R_tip, k=3):
+        """沿果实轴计算半径，果柄端为R_p=R_max*0.1，果尖端为R_tip"""
+        r = np.zeros_like(t)
+        mask1 = t <= 0.5
+        mask2 = t > 0.5
+
+        # 前半段：从R_p到R_max
+        r[mask1] = R_max - (R_max - R_p) * (1 - 2*t[mask1])**k
+        # 后半段：从R_max到R_tip
+        r[mask2] = R_max - (R_max - R_tip) * (2*(t[mask2] - 0.5))**k
+        return r
+
+
     def _update_saved_camera(self, cam):
         self.saved_camera = cam
         print("已保存视角:", cam)
+
 
     def reset_view(self):
         if hasattr(self, 'current_fig'):
@@ -983,55 +995,72 @@ class BananaMorphologyTab(QWidget):
         return np.array(X), np.array(Y)
 
     def create_banana(self, x, Genotype, section_count=200,
-                      end_radius=0.3, smoothness=5, offset=(0,0,0),
-                      min_radius=0.5, handle_sections=20):
-        lp_params = {
-            "DJ": (0.015111173, 3.04229117),
-            "FJ": (0.009060502, 3.721891405),
-            "GJ": (0.041201134, 0.427253611)
-        }
-        if Genotype in lp_params:
-            a, b = lp_params[Genotype]
-        else:
-            a, b = (0.015, 3.0)
-        handle_length = a * x + b
-        handle_length = max(handle_length, 1.0)
-
+                    end_radius=0.3, k=5, offset=(0,0,0),
+                    min_radius=0.05, handle_sections=20):
+        """生成果实3D点云，包括果柄"""
+        # 计算果实弧长参数
         outer_len = self.outer_arc(x, Genotype)
         inner_len = self.inner_arc(x, Genotype)
-        max_circumference = self.circumference(x, Genotype)
-        if outer_len <= inner_len:
-            outer_len = inner_len + 0.1
-        if max_circumference < 2*np.pi*end_radius:
-            max_circumference = 2*np.pi*end_radius + 0.1
-        max_radius = max_circumference/(2*np.pi)
-        radian_angle = (outer_len-inner_len)/(2*(max_radius+end_radius))
-        center_radius = (outer_len+inner_len)/(2*radian_angle)
+        max_circ = self.circumference(x, Genotype)
 
-        t = np.linspace(0,1,section_count)
-        x_center = center_radius*np.cos(radian_angle*(t-0.5)) + offset[0]
-        y_center = center_radius*np.sin(radian_angle*(t-0.5)) + offset[1]
-        z_center = -t*10 + offset[2]
-        center_points = np.stack([x_center,y_center,z_center], axis=1)
+        R_max = max_circ / (2 * np.pi)   # 果实最大半径
+        R_p = 0.1 * R_max                # 果柄端半径为R_max的10%
+        R_tip = 0.3                     # 果尖端半径
 
+        radian_angle = (outer_len - inner_len) / (2*(R_max + end_radius))
+        center_radius = (outer_len + inner_len) / (2 * radian_angle)
+
+        # 果实中心点
+        t = np.linspace(0, 1, section_count)
+        radii = self.radius_profile(t, R_p, R_max, R_tip, k)
+
+        x_center = center_radius * np.cos(radian_angle*(t - 0.5)) + offset[0]
+        y_center = center_radius * np.sin(radian_angle*(t - 0.5)) + offset[1]
+        z_center = -t * 10 + offset[2]
+        center_points = np.stack([x_center, y_center, z_center], axis=1)
+
+        # 切向量
         tangents = np.gradient(center_points, axis=0)
-        tangents /= np.linalg.norm(tangents, axis=1)[:,None]
+        tangents /= np.linalg.norm(tangents, axis=1)[:, None]
 
-        interp_points = self.cross_sections.get(Genotype,3)
+        interp_points = self.cross_sections.get(Genotype, 3)
         X, Y, Z = [], [], []
-        for i,pos_ratio in enumerate(t):
-            radius = max_radius-(max_radius-end_radius)*abs(2*pos_ratio-1)**smoothness
-            if pos_ratio>0.9:
-                radius = max(radius*(1-pos_ratio)*10, min_radius)
-            cx,cy = self.generate_cross_section(radius, interp_points)
+        for i in range(section_count):
+            radius = max(radii[i], min_radius)
+            cx, cy = self.generate_cross_section(radius, interp_points)
             tangent = tangents[i]
-            not_parallel = np.array([0,0,1]) if abs(tangent[2])<0.9 else np.array([0,1,0])
-            normal1 = np.cross(tangent, not_parallel); normal1/=np.linalg.norm(normal1)
-            normal2 = np.cross(tangent, normal1); normal2/=np.linalg.norm(normal2)
-            circle_points = center_points[i][np.newaxis,:] + np.outer(cx, normal1) + np.outer(cy, normal2)
-            X.append(circle_points[:,0]); Y.append(circle_points[:,1]); Z.append(circle_points[:,2])
-        X = np.array(X); Y=np.array(Y); Z=np.array(Z)
+            ref = np.array([0, 0, 1]) if abs(tangent[2]) < 0.9 else np.array([0, 1, 0])
+            n1 = np.cross(tangent, ref); n1 /= np.linalg.norm(n1)
+            n2 = np.cross(tangent, n1); n2 /= np.linalg.norm(n2)
+            pts = center_points[i] + np.outer(cx, n1) + np.outer(cy, n2)
+            X.append(pts[:, 0]); Y.append(pts[:, 1]); Z.append(pts[:, 2])
 
+        X = np.array(X); Y = np.array(Y); Z = np.array(Z)
+
+        # 果柄
+        handle_length = 3.0  # 可根据实际调整
+        last_tangent = tangents[-1]
+        handle_t = np.linspace(0, handle_length, handle_sections)
+        handle_center = center_points[-1][None, :] + handle_t[:, None] * last_tangent
+
+        Xh, Yh, Zh = [], [], []
+        handle_radius_start = radii[-1]
+        handle_radius_end = handle_radius_start * 1.1
+        for i in range(handle_sections):
+            r = handle_radius_start + (handle_radius_end - handle_radius_start) * (i / (handle_sections-1))
+            cx, cy = self.generate_cross_section(r, interp_points)
+            tangent = last_tangent
+            ref = np.array([0,0,1]) if abs(tangent[2])<0.9 else np.array([0,1,0])
+            n1 = np.cross(tangent, ref); n1 /= np.linalg.norm(n1)
+            n2 = np.cross(tangent, n1); n2 /= np.linalg.norm(n2)
+            pts = handle_center[i][None,:] + np.outer(cx, n1) + np.outer(cy, n2)
+            Xh.append(pts[:,0]); Yh.append(pts[:,1]); Zh.append(pts[:,2])
+
+        Xh = np.array(Xh); Yh = np.array(Yh); Zh = np.array(Zh)
+
+        return (X, Y, Z), (Xh, Yh, Zh)
+
+        # 果柄生成
         num_fit = max(2, section_count//10)
         last_pts = center_points[-num_fit:]
         tangent_fit = np.gradient(last_pts, axis=0)
@@ -1042,25 +1071,24 @@ class BananaMorphologyTab(QWidget):
         handle_t = np.linspace(0, handle_length, handle_sections)
         handle_center = handle_start_point + avg_tangent[None,:] * handle_t[:,None]
 
-        final_radius = max_radius-(max_radius-end_radius)*abs(2 * 1.0-1)**smoothness
-        if 1.0 > 0.9:
-            final_radius = max(final_radius*(1-1.0)*10, min_radius)
-
-        handle_radius_start = final_radius * 1.0
+        final_radius = radii[-1]
+        handle_radius_start = final_radius
         handle_radius_end = final_radius * 1.05
+
         Xh,Yh,Zh=[],[],[]
         for i in range(handle_sections):
             r = handle_radius_start + (handle_radius_end-handle_radius_start)*(i/(handle_sections-1))
             cx,cy = self.generate_cross_section(r, interp_points)
             tangent = avg_tangent
-            not_parallel = np.array([0,0,1]) if abs(tangent[2])<0.9 else np.array([0,1,0])
-            normal1 = np.cross(tangent, not_parallel); normal1/=np.linalg.norm(normal1)
-            normal2 = np.cross(tangent, normal1); normal2/=np.linalg.norm(normal2)
-            circle_points = handle_center[i][np.newaxis,:] + np.outer(cx, normal1) + np.outer(cy, normal2)
-            Xh.append(circle_points[:,0]); Yh.append(circle_points[:,1]); Zh.append(circle_points[:,2])
-        Xh=np.array(Xh); Yh=np.array(Yh); Zh=np.array(Zh)
+            ref = np.array([0,0,1]) if abs(tangent[2])<0.9 else np.array([0,1,0])
+            n1 = np.cross(tangent, ref); n1/=np.linalg.norm(n1)
+            n2 = np.cross(tangent, n1); n2/=np.linalg.norm(n2)
+            pts = handle_center[i][np.newaxis,:] + np.outer(cx, n1) + np.outer(cy, n2)
+            Xh.append(pts[:,0]); Yh.append(pts[:,1]); Zh.append(pts[:,2])
+        Xh = np.array(Xh); Yh = np.array(Yh); Zh = np.array(Zh)
 
         return (X,Y,Z),(Xh,Yh,Zh)
+
 
     def update_plot(self):
         self.webview.setHtml("")
